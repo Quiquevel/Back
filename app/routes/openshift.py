@@ -56,6 +56,17 @@ async def execute_heapdump(target: heapdumpmodel, authorization: str = Depends(b
         raise HTTPException(status_code=403, detail=UNAUTHORIZED_USER_ERROR)
     return await getheapdump(functional_environment=target.functionalenvironment, cluster=target.cluster, region=target.region, namespace=target.namespace, pod=target.pod, action=target.action, delete=target.delete)
 
+class cluster_list(BaseModel):
+    functionalenvironment: str
+    ldap: str
+
+@pod_exec.post("/cluster_list")
+async def get_namespace_list(target: cluster_list, authorization: str = Depends(bearer)):  
+    isdevops = await authorizationtreatment(auth=authorization, ldap=target.ldap)
+    if isdevops == False:
+        raise HTTPException(status_code=403, detail=UNAUTHORIZED_USER_ERROR)
+    return await get_clusters()
+    
 class namespace_list(BaseModel):
     functionalenvironment: str
     cluster: str
