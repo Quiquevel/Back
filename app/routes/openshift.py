@@ -62,6 +62,17 @@ class namespace_list(BaseModel):
     region: str
     ldap: str
 
+class cluster_list(BaseModel):
+    functionalenvironment: str
+    ldap: str
+
+@pod_exec.post("/cluster_list")
+async def get_namespace_list(target: cluster_list, authorization: str = Depends(bearer)):  
+    isdevops = await authorizationtreatment(auth=authorization, ldap=target.ldap)
+    if isdevops == False:
+        raise HTTPException(status_code=403, detail=UNAUTHORIZED_USER_ERROR)
+    return await get_clusters()
+
 @pod_exec.post("/namespace_list")
 async def get_namespace_list(target: namespace_list, authorization: str = Depends(bearer)):  
     isdevops = await authorizationtreatment(auth=authorization, ldap=target.ldap)
