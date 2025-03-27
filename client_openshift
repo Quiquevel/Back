@@ -1,0 +1,556 @@
+"""
+This module provides the OpenshiftClient class for interacting with OpenShift clusters.
+It includes methods for initializing the client with Vault configuration, retrieving resources,
+and handling various OpenShift operations.
+Classes:
+    OpenshiftClient: A client for interacting with OpenShift clusters.
+Functions:
+    __init__(self, entity_id): Initializes the OpenshiftClient with the given entity ID.
+    change_entity(self, entity_id): Changes the entity ID and reinitializes the Vault configuration.
+    init_vault(self, entity_id): Initializes the Vault configuration for the given entity ID.
+    _should_use_vault_cache(self): Determines whether the Vault cache should be used.
+    _should_use_vault_client(self): Determines whether the Vault client should be used.
+    _initialize_from_vault_cache(self): Initializes configuration from the Vault cache.
+    _initialize_from_vault_client(self, entity_id): Initializes the client using the Vault Client.
+    _validate_vault_credentials(self): Validates the necessary Vault credentials.
+    _handle_vault_client_fallback(self): Handles the fallback mechanism to use the Vault Client.
+    _get_missing_vault_info_error(self): Retrieves the error message for missing Vault information.
+    set_timeout(self): Sets the timeout for aiohttp client requests.
+    get_resource(self, functional_environment, cluster, resource, namespace, region, name, az): Retrieves a resource from the specified cluster and environment.
+    _get_target_cluster(self, functional_environment, cluster, az, region): Retrieves the target cluster configuration.
+    _fetch_resource(self, resource, url, token, namespace, name): Fetches a specific OpenShift resource.
+    get_bgblock(self, url, token, namespace): Retrieves and classifies Blue-Green deployments and services.
+    _extract_services(self, services): Extracts and categorizes services based on their names.
+    _classify_deployments(self, block, deployments): Classifies deployments based on their selectors.
+    get_url(self, url): Asynchronously retrieves the given URL.
+    openshift_resource(self, url, token, namespace, name): Fetches a resource from the OpenShift API.
+"""
+
+import os, aiohttp, requests
+from shuttlelib.utils.logger import logger
+from shuttlelib.vault.client import VaultClient
+from fastapi import HTTPException
+
+
+#Constants
+
+const_missing_vault_info = "There are missing vault information to set up the client"
+
+class OpenshiftClient:
+    """ 
+    OpenshiftClient is a class that provides methods to interact with an OpenShift cluster.
+    It initializes the client using vault configurations and provides methods to fetch resources
+    from the cluster.
+    Attributes:
+        timeout (aiohttp.ClientTimeout): The timeout configuration for HTTP requests.
+        url_op (str): The URL of the OpenShift API endpoint.
+        token_op (str): The authentication token for accessing the OpenShift API.
+        clusters (dict): The cluster configuration for different entities.
+    Methods:
+        __init__(entity_id):
+            Initializes the OpenshiftClient with the given entity ID.
+        change_entity(entity_id):
+            Changes the entity ID and reinitializes the vault configuration.
+        init_vault(entity_id):
+            Initializes the vault configuration for the given entity ID.
+        _should_use_vault_cache():
+        _should_use_vault_client():
+        _initialize_from_vault_cache():
+            Initializes the configuration from the Vault cache.
+        _initialize_from_vault_client(entity_id):
+            Initializes the client using the Vault Client as the source of truth.
+        _validate_vault_credentials():
+        _handle_vault_client_fallback():
+        _get_missing_vault_info_error():
+            Retrieves the constant value indicating missing vault information error.
+        set_timeout():
+            Returns an aiohttp.ClientTimeout object with total and connection timeouts.
+        async get_resource(functional_environment, cluster=None, resource=None, namespace=None, region=False, name=None, az=None):
+            Retrieves a resource from the specified cluster and environment.
+        _get_target_cluster(functional_environment, cluster, az, region):
+            Retrieves the target cluster configuration based on the provided parameters.
+        async _fetch_resource(resource, url, token, namespace, name):
+        async get_bgblock(url, token, namespace):
+            Retrieves and classifies Blue-Green deployments and services from an OpenShift cluster.
+        _extract_services(services):
+        _classify_deployments(block, deployments):
+        async get_url(url):
+        async openshift_resource(url, token, namespace=None, name=None)
+    """
+
+
+
+    def __init__(self, entity_id) -> None:
+        """
+        The above function initializes an object with a given entity ID, decrypts data using a
+        cryptographic key, and assigns the clusters, timeout, url_op, and token_op attributes.
+        
+        :param entity_id: The `entity_id` parameter is used to identify a specific entity. In this code
+        snippet, if the `entity_id` is `None`, it is set to the default value of "spain". Otherwise, it is
+        used to access a specific cluster from the `clusters` variable
+        """
+        if "VAULT_CACHE" in os.environ.keys() and "VAULT_CACHE_URL" in os.environ.keys():
+            self.init_vault(entity_id)
+        elif "VAULT_SOURCE" in str(os.environ):
+            self.init_vault(entity_id)
+        else:
+            raise ValueError("There are missing vault information to set up the OpenshiftClient")
+
+
+        self.timeout = self.set_timeout()
+        self.url_op = None
+        self.token_op = None
+    
+    def change_entity(self, entity_id):
+        self.init_vault(entity_id)
+
+    def init_vault(self, entity_id):
+        """
+        Initializes the vault configuration.
+        Args:
+            entity_id (str): The entity ID.
+        Raises:
+            ValueError: If there are missing vault information to set up the client.
+        Returns:
+            None
+        """
+
+        logger.info("Initializing vault configuration")
+        logger.debug(f"Entity ID: {entity_id}")
+
+        entity_id = entity_id or "spain"
+
+        if self._should_use_vault_cache():
+            self._initialize_from_vault_cache()
+        elif self._should_use_vault_client():
+            self._initialize_from_vault_client(entity_id)
+        else:
+            raise ValueError(self._get_missing_vault_info_error())
+    
+    def _should_use_vault_cache(self):
+        """
+        Determines whether the Vault cache should be used based on environment variables.
+        This method checks for the presence of the "VAULT_CACHE" environment variable and 
+        verifies if its value is set to "true". Additionally, it checks for the presence 
+        of the "VAULT_CACHE_URL" environment variable.
+        Returns:
+            bool: True if the Vault cache should be used, False otherwise.
+        """
+        
+        return (
+            "VAULT_CACHE" in os.environ.keys()
+            and os.getenv("VAULT_CACHE").lower() == "true"
+            and "VAULT_CACHE_URL" in os.environ.keys()
+        )
+    
+    def _should_use_vault_client(self):
+        """
+        Determines whether the Vault client should be used based on environment variables.
+        This method checks if the environment variable 'VAULT_SOURCE' is present and if its value is set to 'true' (case insensitive).
+        Returns:
+            bool: True if 'VAULT_SOURCE' is present in the environment variables and its value is 'true', False otherwise.
+        """
+
+        return (
+            "VAULT_SOURCE" in str(os.environ)
+            and os.getenv("VAULT_SOURCE").lower() == "true"
+        )
+    
+    def _initialize_from_vault_cache(self):
+        """
+        Initialize configuration from the Vault cache.
+        This method attempts to retrieve cluster configuration from a Vault cache
+        using a GET request. It logs the process and handles any exceptions by
+        falling back to an alternative method.
+        Environment Variables:
+            APP_NAME (str): The name of the application. Defaults to "undefined" if not set.
+            VAULT_CACHE_URL (str): The base URL for the Vault cache.
+        Raises:
+            requests.exceptions.RequestException: If there is an error accessing the Vault cache.
+        """
+        
+        logger.info("Using Vault cache")
+        appname = os.getenv("APP_NAME", "undefined")
+        headers = {
+            "X-shuttle-api-key": "test-key",
+            "X-shuttle-appname": appname
+            }
+        vault_cache_url = os.getenv("VAULT_CACHE_URL")
+
+        try:
+            req = requests.get(url=vault_cache_url + "/cluster", headers=headers, timeout=5)
+            req.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error accessing vault-cache : {e}")
+            self._handle_vault_client_fallback()
+            return
+        
+        clusters = req.json()
+        self.clusters = clusters[os.getenv("ENTITY_ID", "spain")]
+        return
+    
+    def _initialize_from_vault_client(self, entity_id):
+        """
+        Initialize the client using the Vault Client as the source of truth.
+        This method retrieves the necessary credentials from environment variables,
+        validates them, and then uses the Vault Client to construct a map of clusters.
+        The cluster information for the given entity_id is then assigned to the instance.
+        Args:
+            entity_id (str): The identifier for the entity whose cluster information is to be retrieved.
+        Raises:
+            ValueError: If the Vault credentials are not valid or missing.
+        """
+
+        logger.info("Using Vault Client as source of truth")
+
+        if not self._validate_vault_credentials():
+            raise ValueError(self._get_missing_vault_info_error())
+        
+        vault = VaultClient(
+            url=os.getenv("VAULT_URL"),
+            vault_user=os.getenv("VAULT_USER"),
+            vault_password=os.getenv("VAULT_PWD")
+        )
+
+        vault.new_client()
+        clusters = vault.construct_clusters_map()
+        self.clusters = clusters[entity_id][0]
+
+    def _validate_vault_credentials(self):
+        """
+        Validates that the necessary Vault credentials are set as environment variables.
+        This method checks for the presence of the following environment variables:
+        - VAULT_USER
+        - VAULT_PWD
+        - VAULT_URL
+        Returns:
+            bool: True if all required environment variables are set and not empty, False otherwise.
+        """
+
+        required_vars = ["VAULT_USER", "VAULT_PWD", "VAULT_URL"]
+        return all(
+            x != "" for x in [os.getenv(var) for var in required_vars]
+        )
+    
+    def _handle_vault_client_fallback(self):
+        """
+        Handles the fallback mechanism to use the Vault Client as the source of truth.
+        This method logs the usage of the Vault Client and validates the Vault credentials.
+        If the credentials are not valid, it raises a ValueError with the appropriate error message.
+        Raises:
+            ValueError: If the Vault credentials are not valid.
+        """
+
+        logger.info("Entering fallback due previous error")
+        if not self._validate_vault_credentials():
+            raise ValueError(self._get_missing_vault_info_error())
+        self._initialize_from_vault_client(entity_id=os.getenv("ENTITY_ID", "spain"))
+        
+    
+    def _get_missing_vault_info_error(self):
+        """
+        Retrieve the constant value indicating missing vault information error.
+        Returns:
+            str: The constant value representing the missing vault information error.
+        """
+
+        return const_missing_vault_info
+
+
+    def set_timeout(self):
+        """
+        The function `setTimeout` returns an `aiohttp.ClientTimeout` object with total and connection
+        timeouts based on environment variables or default values.
+        :return: an instance of the `aiohttp.ClientTimeout` class with the `total` and `connect` parameters
+        set based on the values of the `TOTAL_TIMEOUT` and `CONNECTION_TIMEOUT` environment variables, or
+        default values of 30 and 5 respectively if the environment variables are not set.
+        """
+        if "TOTAL_TIMEOUT" in str(os.environ):
+            total_timeout = int(os.getenv("TOTAL_TIMEOUT"))
+        else:
+            total_timeout = 30
+
+        if "CONNECTION_TIMEOUT" in str(os.environ):
+            connection_timeout = int(os.getenv("CONNECTION_TIMEOUT"))
+        else:
+            connection_timeout = 5
+        return aiohttp.ClientTimeout(total=total_timeout, connect=connection_timeout)
+
+    async def get_resource(
+        self,
+        functional_environment: str,
+        cluster: str = None,
+        resource: str = None,
+        namespace=None,
+        region=False,
+        name=None,
+        az=None
+    ) -> any:
+        """
+        Retrieve a resource from the specified cluster and environment.
+        Args:
+            functional_environment (str): The functional environment to target, ej: dev, pre, pro.
+            cluster (str, optional): The specific cluster to target, ej: bks, azure. Defaults to None.
+            resource (str, optional): The type of resource to retrieve, ej: pods, deployments... Defaults to None.
+            namespace (str, optional): The namespace of the resource. Defaults to None.
+            region (bool, optional): Whether to target a specific region. Defaults to False.
+            name (str, optional): The name of the resource. Defaults to None.
+            az (str, optional): The availability zone. Defaults to None.
+        Returns:
+            any: The retrieved resource(s).
+        Raises:
+            ValueError: If the specified cluster is not found.
+        """
+        
+        
+        if resource == "clusters":
+            return self.clusters[functional_environment]
+        
+        target_cluster = self._get_target_cluster(functional_environment, cluster, az, region)
+        if len(target_cluster) == 0:
+            logger.error(f"Cluster {cluster} not found")
+            raise ValueError(f"Cluster {cluster} not found")
+        
+        resdict = {}
+        if not region:
+            for item in target_cluster.keys():
+                url, token = target_cluster[item]["url"], target_cluster[item]["token"]
+                self.token_op, self.url_op = token, url
+                res = await self._fetch_resource(resource, url, token, namespace, name)
+                resdict[item] = res
+        else:
+            url, token = target_cluster["url"], target_cluster["token"]
+            self.token_op, self.url_op = token, url
+            res = await self._fetch_resource(resource, url, token, namespace, name)
+            resdict[region] = res
+        
+        return resdict
+
+    def _get_target_cluster(self, functional_environment, cluster, az, region):
+        """
+        Retrieve the target cluster configuration based on the provided parameters.
+        Args:
+            functional_environment (str): The functional environment (e.g., 'dev', 'prod').
+            cluster (str): The cluster name.
+            az (str): The availability zone.
+            region (str): The region name.
+        Returns:
+            dict: The target cluster configuration.
+        Raises:
+            KeyError: If the specified region is not found in the cluster configuration.
+        """
+
+        try:
+            if az:
+                return self.clusters[functional_environment][cluster][az][region] if region else self.clusters[functional_environment][cluster][az]
+            return self.clusters[functional_environment][cluster][region] if region else self.clusters[functional_environment][cluster]
+        except KeyError:
+            logger.error(f"Region {region} not found at {functional_environment}{cluster}")
+            raise KeyError(f"Region {region} not found at {functional_environment}{cluster}")
+
+    async def _fetch_resource(self, resource, url, token, namespace, name):
+        """
+        Fetches a specific OpenShift resource based on the provided parameters.
+        Args:
+            resource (str): The type of resource to fetch (e.g., 'pods', 'services', 'deployments', etc.).
+            url (str): The base URL of the OpenShift API.
+            token (str): The authentication token to access the OpenShift API.
+            namespace (str): The namespace in which the resource resides.
+            name (str): The name of the specific resource to fetch.
+        Returns:
+            dict: The fetched resource data.
+        Raises:
+            ValueError: If the provided resource type is not recognized.
+        """
+
+        resource_map = {
+            "pods": f"{url}/api/v1/namespaces/{namespace}/pods/",
+            "deploymentconfigs": f"{url}/apis/apps.openshift.io/v1/namespaces/{namespace}/deploymentconfigs/",
+            "routes": f"{url}/apis/route.openshift.io/v1/namespaces/{namespace}/routes/",
+            "services": f"{url}/api/v1/namespaces/{namespace}/services/",
+            "namespaces": f"{url}/api/v1/namespaces/" if name else f"{url}/apis/project.openshift.io/v1/projects/",
+            "replicationcontrollers": f"{url}/api/v1/namespaces/{namespace}/replicationcontrollers/",
+            "hpas": f"{url}/apis/autoscaling/v1/namespaces/{namespace}/horizontalpodautoscalers/",
+            "deployments": f"{url}/apis/apps/v1/namespaces/{namespace}/deployments/",
+            "statefulsets": f"{url}/apis/apps/v1/namespaces/{namespace}/statefulsets/",
+            "replicasets": f"{url}/apis/apps/v1/namespaces/{namespace}/replicasets/",
+            "configmaps": f"{url}/api/v1/namespaces/{namespace}/configmaps/",
+            "secrets": f"{url}/api/v1/namespaces/{namespace}/secrets/",
+            "networkpolicies": f"{url}/apis/networking.k8s.io/v1/namespaces/{namespace}/networkpolicies/",
+            "quotas": f"{url}/api/v1/namespaces/{namespace}/resourcequotas/",
+            "cronjobs": f"{url}/apis/batch/v1/namespaces/{namespace}/cronjobs/",
+            "jobs": f"{url}/apis/batch/v1/namespaces/{namespace}/jobs/",
+            "persistentvolumeclaims": f"{url}/api/v1/namespaces/{namespace}/persistentvolumeclaims/",
+            "url": url,
+            "bgblock": None
+        }
+
+        if resource not in resource_map:
+            raise ValueError(f"resource {resource} not recognized")
+
+        req_url = resource_map[resource]
+        if resource == "url":
+            return await self.get_url(url=url)
+        if resource == "bgblock":
+            return await self.get_bgblock(url=url, token=token, namespace=namespace)
+        
+        return await self.openshift_resource(url=req_url, token=token, namespace=namespace, name=name)
+
+    async def get_bgblock(self, url, token, namespace):
+        """
+        Retrieve and classify Blue-Green deployments and services from an OpenShift cluster.
+        Args:
+            url (str): The URL of the OpenShift API server.
+            token (str): The authentication token for accessing the OpenShift API.
+            namespace (str): The namespace from which to retrieve services and deployments.
+        Returns:
+            dict: A dictionary containing the classified Blue-Green deployments and their statuses.
+              If there are missing deployments, returns a dictionary with an error message.
+              Example:
+              {
+                  "bg-deployments": [...],
+                  "gb-deployments": [...]
+              or
+              {
+                  "items": "ko, there are missing deployments"
+        """
+
+        services = await self.get_services(url=url, token=token, namespace=namespace)
+        deployments = await self.get_deployments(url=url, token=token, namespace=namespace)
+
+        bg_block, gb_block = self._extract_services(services)
+        bg_deployment = self._classify_deployments(bg_block, deployments)
+        gb_deployment = self._classify_deployments(gb_block, deployments)
+
+        bg_status = len(bg_block) == len(bg_deployment)
+        gb_status = len(gb_block) == len(gb_deployment)
+
+        if not bg_status or not gb_status:
+            return {"items": "ko, there are missing deployments"}
+        else:
+            return {
+                "items": {
+                    "bg-deployments": bg_deployment,
+                    "gb-deployments": gb_deployment,
+                }
+            }
+
+    def _extract_services(self, services):
+        """
+        Extracts and categorizes services based on their names.
+        This method processes a dictionary of services and categorizes them into two lists:
+        - `bg_block`: Services whose names start with "b-g-"
+        - `gb_block`: Services whose names start with "g-b-"
+        Each service in the lists is represented as a dictionary containing:
+        - `name`: The name of the service.
+        - `selector`: The value of the "app_name" key from the service's "selector" dictionary, or "missing" if not present.
+        Args:
+            services (dict): A dictionary containing service information with a key "items" that is a list of service dictionaries.
+        Returns:
+            tuple: A tuple containing two lists:
+                - `bg_block` (list): List of services with names starting with "b-g-".
+                - `gb_block` (list): List of services with names starting with "g-b-".
+        """
+
+        bg_block = []
+        gb_block = []
+
+        for service in services["items"]:
+            if str(service["name"]).startswith("b-g-"):
+                bg_block.append(
+                    {
+                        "name": service["name"],
+                        "selector": service.get("selector", {}).get("app_name", "missing"),
+                    }
+                )
+            elif str(service["name"]).startswith("g-b-"):
+                gb_block.append(
+                    {
+                        "name": service["name"],
+                        "selector": service.get("selector", {}).get("app_name", "missing"),
+                    }
+                )
+        return bg_block, gb_block
+
+    def _classify_deployments(self, block, deployments):
+        """
+        Classifies deployments based on the presence of their selectors in the given deployments list.
+        Args:
+            block (list): A list of deployment dictionaries, each containing a "selector" key.
+            deployments (dict): A dictionary containing a list of deployment items under the "items" key.
+        Returns:
+            list: A list of selectors that are present in the deployments list.
+        """
+
+        deployment_list = []
+        for deployment in block:
+            if deployment["selector"] != "missing" and deployment["selector"] in str(deployments["items"]):
+                deployment_list.append(deployment["selector"])
+        return deployment_list
+
+    async def get_url(self, url):
+        """
+        Asynchronously retrieves the given URL.
+        Args:
+            url (str): The URL to be retrieved.
+        Returns:
+            str: The same URL that was passed as an argument.
+        """
+
+        return url
+
+    async def openshift_resource(self, url, token, namespace=None, name=None):
+        """
+        Fetches a resource from the OpenShift API.
+        Args:
+            url (str): The URL of the OpenShift API endpoint.
+            token (str): The authentication token for accessing the OpenShift API.
+            namespace (str, optional): The namespace of the resource. Defaults to None.
+            name (str, optional): The name of the specific resource. Defaults to None.
+        Returns:
+            dict: A dictionary containing the resource data if the request is successful.
+            int: The HTTP status code if the request fails.
+        Raises:
+            ValueError: If there is an error generating the response.
+        """
+
+        header = {"Authorization": f"Bearer {str(token)}", "Accept": "application/json"}
+        resource = str(url).split("/")[-2]
+        logger.debug(f"Calling Openshift API to obtain {resource} from {url}")
+
+        if name != None:
+            req_url = f"{url}{name}"
+        else:
+            req_url = url
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                req_url, headers=header, verify_ssl=False, timeout=self.timeout
+            ) as r:
+                response = await r.json()
+                logger.debug(f"Respuesta: {r.status}, {r.reason}")
+                if r.status == 200:
+                    try:
+                        logger.debug(
+                            f"Generating response with {resource} of {namespace}"
+                        )
+                        resdict = {}
+                        if name != None:
+                            resdict = response
+                            return resdict
+                        else:
+                            resdict["kind"] = response["kind"]
+                            resdict["items"] = response["items"]
+                        return resdict
+                    except Exception:
+                        logger.error(
+                            f"Error generating response for {resource} of {namespace}"
+                        )
+                        raise ValueError(
+                            f"Error generating response for {resource} of {namespace}"
+                        )
+                else:
+                    logger.error(
+                        f"Error generating response for {resource} of {namespace}, STATUS: {r.status}, MESSAGE: {r.reason}"
+                    )
+                    raise HTTPException(status_code=400, detail=f"Error generating response for {resource} of {namespace}, STATUS: {r.status}, MESSAGE: {r.reason}")
